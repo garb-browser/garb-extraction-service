@@ -1,1 +1,2 @@
-DatabaseServer/.env
+env
+__pycache__
