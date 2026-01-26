@@ -1,7 +1,9 @@
 """
 GARB Extraction Service
 Extracts article content from web pages for eye tracking research.
-Uses Mozilla Readability algorithm for high-quality content extraction.
+Uses a cascade of extraction algorithms for high-quality content extraction:
+  1. Trafilatura (primary) - Best overall recall and modern web structure handling
+  2. Mozilla Readability (fallback) - Reliable for simpler page structures
 Preserves formatting, images, and metadata while removing ads/navigation.
 """
 
@@ -15,6 +17,16 @@ from urllib.parse import urljoin, urlparse
 from datetime import datetime
 import hashlib
 import requests
+import trafilatura
+from trafilatura.settings import use_config
+
+# Configure trafilatura for optimal extraction
+TRAFILATURA_CONFIG = use_config()
+TRAFILATURA_CONFIG.set("DEFAULT", "EXTRACTION_TIMEOUT", "30")
+TRAFILATURA_CONFIG.set("DEFAULT", "MIN_OUTPUT_SIZE", "100")
+
+# Minimum word count to consider extraction successful
+MIN_WORDS_THRESHOLD = 50
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
@@ -57,6 +69,57 @@ def resolve_image_url(src, base_url):
     return src
 
 
+def normalize_image_url(src):
+    """Normalize image URL for deduplication."""
+    if not src:
+        return ''
+    # Remove query parameters and fragments for comparison
+    parsed = urlparse(src)
+    path = parsed.path
+
+    # Special handling for Wikipedia/Wikimedia images
+    # URLs like: /wikipedia/commons/thumb/a/ab/Image.jpg/220px-Image.jpg
+    # Should normalize to the base image: /wikipedia/commons/a/ab/Image.jpg
+    # Check both by domain AND by path pattern (for relative URLs)
+    is_wikimedia = (
+        'wikimedia.org' in parsed.netloc or
+        'wikipedia.org' in parsed.netloc or
+        '/wikipedia/' in path or
+        '/commons/' in path or
+        'upload.wikimedia' in src.lower()
+    )
+
+    if is_wikimedia and '/thumb/' in path:
+        # Extract base path: /commons/thumb/a/ab/Image.jpg/220px-Image.jpg -> /commons/a/ab/Image.jpg
+        parts = path.split('/thumb/')
+        if len(parts) == 2:
+            prefix = parts[0]  # /wikipedia/commons
+            rest = parts[1]    # a/ab/Image.jpg/220px-Image.jpg
+            # Remove the last segment (size variant like 220px-Image.jpg)
+            rest_parts = rest.rsplit('/', 1)
+            if len(rest_parts) == 2 and re.match(r'\d+px-', rest_parts[1]):
+                path = f"{prefix}/{rest_parts[0]}"  # /wikipedia/commons/a/ab/Image.jpg
+
+    # For Wikimedia, also extract just the filename for better deduplication
+    # because the same image can appear via different paths
+    if is_wikimedia:
+        # Extract the actual filename (last meaningful part before size suffix)
+        # e.g., "Image.jpg" from various path formats
+        filename_match = re.search(r'/([^/]+\.(jpg|jpeg|png|gif|svg|webp))', path, re.I)
+        if filename_match:
+            # Use just the filename as the key (more aggressive deduplication)
+            return f"wikimedia:{filename_match.group(1).lower()}"
+
+    # Keep just scheme, netloc, and normalized path
+    normalized = f"{parsed.scheme}://{parsed.netloc}{path}"
+    # Normalize scheme
+    if normalized.startswith('//'):
+        normalized = 'https:' + normalized
+    elif normalized.startswith(':/'):
+        normalized = 'https' + normalized
+    return normalized.lower()
+
+
 def is_valid_content_image(src, alt=''):
     """Check if an image is likely content (not ad/tracking/logo)."""
     if not src:
@@ -91,6 +154,41 @@ def clean_text(text):
     # Strip leading/trailing whitespace
     text = text.strip()
     return text
+
+
+def is_citation_link(href, link_text):
+    """
+    Check if a link is a Wikipedia citation reference that should be filtered out.
+    Returns True if the link looks like a citation (e.g., [10], [23]) pointing to #cite_note.
+    """
+    if not href or not link_text:
+        return False
+
+    href_lower = href.lower()
+    text_stripped = link_text.strip()
+
+    # Check if URL contains citation anchor patterns
+    is_cite_url = (
+        '#cite_note' in href_lower or
+        '#cite_ref' in href_lower or
+        '#ref-' in href_lower or
+        '#note-' in href_lower or
+        '#endnote' in href_lower or
+        '#footnote' in href_lower
+    )
+
+    # Check if link text looks like a citation number: [1], [23], 1, 23, etc.
+    is_cite_text = bool(re.match(r'^\[?\d+\]?$', text_stripped))
+
+    # Also catch superscript-style citations like "10" that link to citations
+    if is_cite_url and is_cite_text:
+        return True
+
+    # If URL is clearly a citation link, filter it regardless of text
+    if is_cite_url and len(text_stripped) <= 5:
+        return True
+
+    return False
 
 
 def preprocess_html_for_readability(html, url=''):
@@ -230,20 +328,27 @@ def extract_text_with_links(element, base_url=''):
                 result_parts.append(cleaned)
                 plain_parts.append(cleaned)
         elif child.name == 'a':
-            # Hyperlink - preserve it
+            # Hyperlink - preserve it (unless it's a citation)
             href = child.get('href', '')
+            link_text = clean_text(child.get_text(separator=' '))
+
+            # For citation links, keep the number but don't make it a hyperlink
+            if is_citation_link(href, link_text):
+                if link_text:
+                    result_parts.append(link_text)  # Just the number, no link marker
+                    plain_parts.append(link_text)
+                continue
+
             if href and not href.startswith('#') and not href.startswith('javascript:'):
                 # Resolve relative URLs
                 if href.startswith('/') or not href.startswith('http'):
                     href = urljoin(base_url, href)
-                link_text = clean_text(child.get_text(separator=' '))
                 if link_text:
                     # Format: [[link_text|url]]
                     result_parts.append(f'[[{link_text}|{href}]]')
                     plain_parts.append(link_text)
             else:
                 # Invalid or anchor link - just get text
-                link_text = clean_text(child.get_text(separator=' '))
                 if link_text:
                     result_parts.append(link_text)
                     plain_parts.append(link_text)
@@ -293,7 +398,24 @@ def extract_with_readability(html, url=''):
     # Extract structured content
     formatted_parts = []
     images = []
-    seen_images = set()
+    seen_images = set()  # Uses normalized URLs for deduplication
+
+    def add_image_if_new(src, alt='', img_type='inline', caption=''):
+        """Add image if not already seen (using normalized URL)."""
+        if not src:
+            return False
+        normalized = normalize_image_url(src)
+        if normalized and normalized not in seen_images and is_valid_content_image(src):
+            seen_images.add(normalized)
+            formatted_parts.append({
+                'type': 'image',
+                'src': src,
+                'alt': alt or caption,
+                'caption': caption if caption else None
+            })
+            images.append({'src': src, 'type': img_type, 'alt': alt or caption})
+            return True
+        return False
 
     # Process all elements in order
     for element in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -327,14 +449,7 @@ def extract_with_readability(html, url=''):
             # Check for images inside paragraph
             for img in element.find_all('img'):
                 src = resolve_image_url(img.get('src', ''), url)
-                if src and src not in seen_images and is_valid_content_image(src):
-                    seen_images.add(src)
-                    formatted_parts.append({
-                        'type': 'image',
-                        'src': src,
-                        'alt': img.get('alt', '')
-                    })
-                    images.append({'src': src, 'type': 'inline', 'alt': img.get('alt', '')})
+                add_image_if_new(src, img.get('alt', ''))
 
             # Extract text with links preserved
             extracted = extract_text_with_links(element, url)
@@ -380,30 +495,15 @@ def extract_with_readability(html, url=''):
             img = element.find('img')
             if img:
                 src = resolve_image_url(img.get('src', ''), url)
-                if src and src not in seen_images and is_valid_content_image(src):
-                    seen_images.add(src)
-                    caption = ''
-                    figcaption = element.find('figcaption')
-                    if figcaption:
-                        caption = clean_text(figcaption.get_text(separator=' '))
-                    formatted_parts.append({
-                        'type': 'image',
-                        'src': src,
-                        'alt': img.get('alt', '') or caption,
-                        'caption': caption
-                    })
-                    images.append({'src': src, 'type': 'inline', 'alt': caption})
+                caption = ''
+                figcaption = element.find('figcaption')
+                if figcaption:
+                    caption = clean_text(figcaption.get_text(separator=' '))
+                add_image_if_new(src, img.get('alt', ''), 'inline', caption)
 
         elif tag_name == 'img':
             src = resolve_image_url(element.get('src', ''), url)
-            if src and src not in seen_images and is_valid_content_image(src):
-                seen_images.add(src)
-                formatted_parts.append({
-                    'type': 'image',
-                    'src': src,
-                    'alt': element.get('alt', '')
-                })
-                images.append({'src': src, 'type': 'inline', 'alt': element.get('alt', '')})
+            add_image_if_new(src, element.get('alt', ''))
 
         elif tag_name == 'table':
             # Skip tables that look like metadata/infoboxes
@@ -509,11 +609,324 @@ def extract_metadata(html, url=''):
     return metadata
 
 
+def extract_with_trafilatura(html, url=''):
+    """
+    Extract article content using Trafilatura.
+    Trafilatura has better recall than Readability for complex page structures.
+    Returns structured content in the same format as extract_with_readability.
+    """
+    try:
+        # Extract main text with trafilatura
+        # include_images=True to get image references
+        # include_links=True to preserve hyperlinks
+        extracted = trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            include_images=True,
+            include_links=True,
+            output_format='xml',  # XML gives us structured content
+            config=TRAFILATURA_CONFIG
+        )
+
+        if not extracted:
+            print("Trafilatura: No content extracted")
+            return None
+
+        # Also extract as plain text for word count check
+        plain_text = trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            output_format='txt',
+            config=TRAFILATURA_CONFIG
+        ) or ''
+
+        # Check if we got enough content
+        word_count = len(plain_text.split())
+        if word_count < MIN_WORDS_THRESHOLD:
+            print(f"Trafilatura: Insufficient content ({word_count} words < {MIN_WORDS_THRESHOLD})")
+            return None
+
+        # Parse the XML output to build structured content
+        from xml.etree import ElementTree as ET
+        try:
+            root = ET.fromstring(f"<root>{extracted}</root>")
+        except ET.ParseError:
+            # If XML parsing fails, fall back to plain text
+            print("Trafilatura: XML parsing failed, using plain text")
+            root = None
+
+        formatted_parts = []
+        images = []
+        seen_images = set()
+
+        # Parse original HTML for images and title
+        original_soup = BeautifulSoup(html, 'lxml')
+
+        # Get title from metadata
+        title = ''
+        title_meta = original_soup.find('meta', property='og:title')
+        if title_meta and title_meta.get('content'):
+            title = title_meta['content']
+        if not title:
+            title_tag = original_soup.find('title')
+            if title_tag:
+                title = clean_text(title_tag.get_text())
+
+        if root is not None:
+            # Helper function to get ALL text from an element including nested children
+            def get_full_text(elem):
+                """Get all text content from element including nested elements."""
+                return clean_text(''.join(elem.itertext()))
+
+            def get_text_with_links(elem, base_url=''):
+                """
+                Get text from element with links preserved as [[text|url]] markers.
+                Similar to extract_text_with_links but for XML elements.
+                Returns dict with 'text' (plain) and 'html' (with link markers).
+                """
+                result_parts = []  # With link markers
+                plain_parts = []   # Plain text
+
+                def process_element(el):
+                    # Handle element's direct text
+                    if el.text:
+                        text = el.text.strip()
+                        if text:
+                            result_parts.append(text)
+                            plain_parts.append(text)
+
+                    # Process children
+                    for child in el:
+                        child_tag = child.tag.lower() if child.tag else ''
+
+                        if child_tag == 'ref':
+                            # Link element - extract href and text
+                            href = child.get('target') or child.get('href') or ''
+                            link_text = ''.join(child.itertext()).strip()
+
+                            # For citation links, keep the number but don't make it a hyperlink
+                            if is_citation_link(href, link_text):
+                                if link_text:
+                                    result_parts.append(link_text)  # Just the number, no link marker
+                                    plain_parts.append(link_text)
+                                continue
+
+                            if href and link_text:
+                                # Resolve relative URLs
+                                if href.startswith('/') or (not href.startswith('http') and not href.startswith('//')):
+                                    href = urljoin(base_url, href)
+                                # Add as link marker
+                                result_parts.append(f'[[{link_text}|{href}]]')
+                                plain_parts.append(link_text)
+                            elif link_text:
+                                result_parts.append(link_text)
+                                plain_parts.append(link_text)
+                        elif child_tag in ['hi', 'emph', 'b', 'i', 'strong', 'em']:
+                            # Inline formatting - recursively process
+                            nested = get_text_with_links(child, base_url)
+                            result_parts.append(nested['html'])
+                            plain_parts.append(nested['text'])
+                        else:
+                            # Other elements - get their text
+                            child_text = ''.join(child.itertext()).strip()
+                            if child_text:
+                                result_parts.append(child_text)
+                                plain_parts.append(child_text)
+
+                        # Handle tail text (text after child element)
+                        if child.tail:
+                            tail = child.tail.strip()
+                            if tail:
+                                result_parts.append(tail)
+                                plain_parts.append(tail)
+
+                process_element(elem)
+
+                html_result = ' '.join(result_parts)
+                text_result = ' '.join(plain_parts)
+
+                # Clean up extra spaces
+                html_result = clean_text(html_result)
+                text_result = clean_text(text_result)
+
+                return {'html': html_result, 'text': text_result}
+
+            # Track processed elements to avoid duplicates
+            processed_elements = set()
+
+            # Process XML elements - only handle top-level content elements
+            for element in root.iter():
+                # Skip if already processed (as part of a parent)
+                if id(element) in processed_elements:
+                    continue
+
+                tag = element.tag.lower() if element.tag else ''
+
+                # Skip inline elements - they're processed as part of their parent
+                if tag in ['hi', 'ref', 'a', 'link', 'item', 'cell', 'row']:
+                    continue
+
+                if tag == 'head':
+                    # Heading element - get full text including any nested formatting
+                    text = get_full_text(element)
+                    if text and len(text) > 2:
+                        formatted_parts.append({
+                            'type': 'heading',
+                            'level': 2,
+                            'text': text
+                        })
+                        # Mark all children as processed
+                        for child in element.iter():
+                            processed_elements.add(id(child))
+
+                elif tag == 'p':
+                    # Paragraph - get text with links preserved
+                    extracted = get_text_with_links(element, url)
+                    text = extracted['text']
+                    html_with_links = extracted['html']
+                    if text and len(text) > 15:
+                        formatted_parts.append({
+                            'type': 'paragraph',
+                            'text': text,
+                            'html': html_with_links  # Contains [[text|url]] link markers
+                        })
+                        # Mark all children as processed
+                        for child in element.iter():
+                            processed_elements.add(id(child))
+
+                elif tag == 'quote':
+                    # Blockquote - get full text
+                    text = get_full_text(element)
+                    if text:
+                        formatted_parts.append({
+                            'type': 'quote',
+                            'text': text
+                        })
+                        for child in element.iter():
+                            processed_elements.add(id(child))
+
+                elif tag == 'list':
+                    # List items - get full text for each item
+                    items = []
+                    for item in element.findall('.//item'):
+                        item_text = get_full_text(item)
+                        if item_text:
+                            items.append(item_text)
+                        processed_elements.add(id(item))
+                    if items:
+                        formatted_parts.append({
+                            'type': 'list',
+                            'ordered': False,
+                            'items': items
+                        })
+                    for child in element.iter():
+                        processed_elements.add(id(child))
+
+                elif tag == 'graphic':
+                    # Image reference
+                    src = element.get('src', '')
+                    if src:
+                        src = resolve_image_url(src, url)
+                        normalized = normalize_image_url(src)
+                        if src and normalized not in seen_images and is_valid_content_image(src):
+                            seen_images.add(normalized)
+                            alt = element.get('alt', '') or element.get('title', '')
+                            formatted_parts.append({
+                                'type': 'image',
+                                'src': src,
+                                'alt': alt
+                            })
+                            images.append({'src': src, 'type': 'inline', 'alt': alt})
+                    processed_elements.add(id(element))
+        else:
+            # Fallback: split plain text into paragraphs
+            paragraphs = [p.strip() for p in plain_text.split('\n\n') if p.strip()]
+            for para in paragraphs:
+                if len(para) > 15:
+                    formatted_parts.append({
+                        'type': 'paragraph',
+                        'text': para,
+                        'html': para
+                    })
+
+        # Try to find images from original page if none found
+        if not images:
+            og_image = original_soup.find('meta', property='og:image')
+            if og_image and og_image.get('content'):
+                src = resolve_image_url(og_image['content'], url)
+                if src and is_valid_content_image(src):
+                    images.append({'src': src, 'type': 'top', 'alt': ''})
+
+            if not images:
+                article_img = original_soup.select_one('article img, .article img, main img')
+                if article_img:
+                    src = resolve_image_url(article_img.get('src', ''), url)
+                    if src and is_valid_content_image(src):
+                        images.append({'src': src, 'type': 'top', 'alt': article_img.get('alt', '')})
+
+        print(f"Trafilatura: Extracted {len(formatted_parts)} content blocks, {word_count} words")
+
+        return {
+            'title': title,
+            'formatted': formatted_parts,
+            'plain': plain_text,
+            'images': images,
+            'extractor': 'trafilatura'
+        }
+
+    except Exception as e:
+        print(f"Trafilatura extraction error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def extract_with_cascade(html, url=''):
+    """
+    Extract content using a cascade of extractors.
+    Tries Trafilatura first (better recall), falls back to Readability.
+    Returns the best result along with which extractor was used.
+    """
+    # Try Trafilatura first (better for complex page structures)
+    print(f"Attempting extraction with Trafilatura...")
+    result = extract_with_trafilatura(html, url)
+
+    if result and len(result.get('formatted', [])) >= 3:
+        # Trafilatura succeeded with sufficient content
+        print(f"Trafilatura extraction successful")
+        return result
+
+    # Fall back to Readability
+    print(f"Falling back to Readability...")
+    readability_result = extract_with_readability(html, url)
+    readability_result['extractor'] = 'readability'
+
+    # If Trafilatura got some content, compare and use the better one
+    if result and result.get('plain'):
+        trafilatura_words = len(result['plain'].split())
+        readability_words = len(readability_result.get('plain', '').split())
+
+        # Use whichever got more content (with a small bias toward Trafilatura)
+        if trafilatura_words > readability_words * 0.8:
+            print(f"Using Trafilatura result ({trafilatura_words} words vs {readability_words})")
+            return result
+        else:
+            print(f"Using Readability result ({readability_words} words vs {trafilatura_words})")
+            return readability_result
+
+    print(f"Using Readability result")
+    return readability_result
+
+
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
 @cross_origin()
 def content_extractor():
     if request.method == 'GET':
-        return "<h1>GARB Extraction Service - Running</h1><p>POST a URL or JSON with raw HTML to extract article content. Now using Mozilla Readability for better extraction!</p>"
+        return "<h1>GARB Extraction Service - Running</h1><p>POST a URL or JSON with raw HTML to extract article content. Using Trafilatura (primary) with Readability fallback for optimal extraction.</p>"
 
     if request.method == 'POST':
         try:
@@ -582,8 +995,8 @@ def content_extractor():
                         }), 200
                     raise
 
-            # Extract content using Readability
-            content_data = extract_with_readability(html, url)
+            # Extract content using cascade (Trafilatura -> Readability)
+            content_data = extract_with_cascade(html, url)
             metadata = extract_metadata(html, url)
 
             if not content_data['plain']:
@@ -594,17 +1007,44 @@ def content_extractor():
                     'formatted_content': []
                 }), 200
 
-            # Build response
+            # Build response - with final deduplication of images
             images = content_data['images']
+            formatted_content = content_data['formatted']
+
+            # Final deduplication pass for images in formatted_content
+            # This catches any duplicates that slipped through earlier checks
+            seen_img_keys = set()
+            deduplicated_formatted = []
+            for block in formatted_content:
+                if block.get('type') == 'image':
+                    img_src = block.get('src', '')
+                    img_key = normalize_image_url(img_src)
+                    if img_key and img_key in seen_img_keys:
+                        continue  # Skip duplicate image
+                    seen_img_keys.add(img_key)
+                deduplicated_formatted.append(block)
+
+            # Also deduplicate the images array
+            seen_img_keys_list = set()
+            deduplicated_images = []
+            for img in images:
+                img_key = normalize_image_url(img.get('src', ''))
+                if img_key and img_key in seen_img_keys_list:
+                    continue
+                seen_img_keys_list.add(img_key)
+                deduplicated_images.append(img)
+
+            extractor_used = content_data.get('extractor', 'unknown')
             response_data = {
                 'title': content_data['title'] or 'Untitled Article',
-                'img_src': images[0]['src'] if images else '',
+                'img_src': deduplicated_images[0]['src'] if deduplicated_images else '',
                 'content': content_data['plain'],  # Backward compatibility
-                'formatted_content': content_data['formatted'],
-                'images': images,
+                'formatted_content': deduplicated_formatted,  # Use deduplicated version
+                'images': deduplicated_images,  # Use deduplicated version
                 'metadata': metadata,
                 'url': url,
-                'extraction_time_ms': (datetime.now() - start_time).total_seconds() * 1000
+                'extraction_time_ms': (datetime.now() - start_time).total_seconds() * 1000,
+                'extractor': extractor_used  # Track which extractor was used
             }
 
             # Cache the result (only for URL mode)
@@ -615,7 +1055,7 @@ def content_extractor():
                     del extraction_cache[oldest_key]
                 extraction_cache[cache_key] = response_data
 
-            print(f"Extracted in {response_data['extraction_time_ms']:.0f}ms: {content_data['title'][:50] if content_data['title'] else 'Unknown'}...")
+            print(f"Extracted in {response_data['extraction_time_ms']:.0f}ms using {extractor_used}: {content_data['title'][:50] if content_data['title'] else 'Unknown'}...")
 
             return jsonify(response_data)
 
@@ -636,7 +1076,9 @@ def health_check():
     """Health check endpoint for monitoring."""
     return jsonify({
         'status': 'healthy',
-        'engine': 'mozilla-readability',
+        'engine': 'trafilatura-readability-cascade',
+        'primary': 'trafilatura',
+        'fallback': 'readability',
         'cache_size': len(extraction_cache),
         'cache_max': CACHE_MAX_SIZE
     })
@@ -652,5 +1094,5 @@ def clear_cache():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9000))
     print(f"Starting GARB Extraction Service on port {port}")
-    print("Using Mozilla Readability for content extraction")
+    print("Using Trafilatura (primary) with Readability (fallback) for content extraction")
     app.run(host='0.0.0.0', port=port)
