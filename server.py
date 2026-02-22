@@ -31,6 +31,19 @@ MIN_WORDS_THRESHOLD = 50
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+# Optional API key authentication
+EXTRACT_API_KEY = os.environ.get('EXTRACT_API_KEY', '')
+
+
+def check_api_key():
+    """Check API key if EXTRACT_API_KEY is set. Returns error response or None."""
+    if not EXTRACT_API_KEY:
+        return None  # No key configured, allow all requests
+    provided_key = request.headers.get('X-API-Key', '')
+    if provided_key != EXTRACT_API_KEY:
+        return jsonify({'error': 'Invalid or missing API key'}), 401
+    return None
+
 # Simple in-memory cache (URL hash -> extracted content)
 extraction_cache = {}
 CACHE_MAX_SIZE = 100
@@ -951,6 +964,11 @@ def content_extractor():
         return "<h1>GARB Extraction Service - Running</h1><p>POST a URL or JSON with raw HTML to extract article content. Using Trafilatura (primary) with Readability fallback for optimal extraction.</p>"
 
     if request.method == 'POST':
+        # Check API key authentication
+        auth_error = check_api_key()
+        if auth_error:
+            return auth_error
+
         try:
             # Check if it's JSON (raw HTML mode) or plain text (URL mode)
             content_type = request.content_type or ''
@@ -1115,6 +1133,9 @@ def health_check():
 @app.route('/clear-cache', methods=['POST'])
 def clear_cache():
     """Clear the extraction cache."""
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
     extraction_cache.clear()
     return jsonify({'status': 'cache cleared'})
 
