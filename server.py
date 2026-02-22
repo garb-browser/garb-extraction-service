@@ -44,16 +44,38 @@ def get_cache_key(url):
     return hashlib.md5(url.encode()).hexdigest()
 
 
+MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB
+
+
 def fetch_url(url):
-    """Fetch URL content with proper headers."""
+    """Fetch URL content with proper headers. Enforces a 10MB size limit."""
     headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
     }
-    response = requests.get(url, headers=headers, timeout=15)
+    response = requests.get(url, headers=headers, timeout=15, stream=True)
     response.raise_for_status()
-    return response.text
+
+    # Check Content-Length header first
+    content_length = response.headers.get('Content-Length')
+    if content_length and int(content_length) > MAX_CONTENT_SIZE:
+        response.close()
+        raise ValueError(f'Response too large: {int(content_length)} bytes exceeds {MAX_CONTENT_SIZE} byte limit')
+
+    # Read in chunks to enforce limit even without Content-Length
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        total += len(chunk)
+        if total > MAX_CONTENT_SIZE:
+            response.close()
+            raise ValueError(f'Response too large: exceeds {MAX_CONTENT_SIZE} byte limit')
+        chunks.append(chunk)
+
+    content = b''.join(chunks)
+    encoding = response.encoding or response.apparent_encoding or 'utf-8'
+    return content.decode(encoding, errors='replace')
 
 
 def resolve_image_url(src, base_url):
