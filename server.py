@@ -935,7 +935,13 @@ def content_extractor():
 
             if 'application/json' in content_type:
                 # JSON mode: { url: "...", html: "..." }
-                data = request.get_json()
+                data = request.get_json(silent=True)
+                if data is None:
+                    return jsonify({'error': 'Invalid JSON body'}), 400
+                if not isinstance(data, dict):
+                    return jsonify({'error': 'Request body must be a JSON object'}), 400
+                if 'url' not in data and 'html' not in data:
+                    return jsonify({'error': "Request must include 'url' or 'html' field"}), 400
                 url = data.get('url', '')
                 raw_html = data.get('html', '')
                 use_raw_html = bool(raw_html)
