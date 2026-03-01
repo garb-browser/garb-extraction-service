@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS, cross_origin
 from readability import Document
 from bs4 import BeautifulSoup
+import hmac
 import os
 import re
 from urllib.parse import urljoin, urlparse
@@ -40,7 +41,7 @@ def check_api_key():
     if not EXTRACT_API_KEY:
         return None  # No key configured, allow all requests
     provided_key = request.headers.get('X-API-Key', '')
-    if provided_key != EXTRACT_API_KEY:
+    if not hmac.compare_digest(provided_key, EXTRACT_API_KEY):
         return jsonify({'error': 'Invalid or missing API key'}), 401
     return None
 
