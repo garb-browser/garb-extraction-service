@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS, cross_origin
 from readability import Document
 from bs4 import BeautifulSoup
+import hmac
 import os
 import re
 from urllib.parse import urljoin, urlparse
@@ -31,6 +32,19 @@ MIN_WORDS_THRESHOLD = 50
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+# Optional API key authentication
+EXTRACT_API_KEY = os.environ.get('EXTRACT_API_KEY', '')
+
+
+def check_api_key():
+    """Check API key if EXTRACT_API_KEY is set. Returns error response or None."""
+    if not EXTRACT_API_KEY:
+        return None  # No key configured, allow all requests
+    provided_key = request.headers.get('X-API-Key', '')
+    if not hmac.compare_digest(provided_key, EXTRACT_API_KEY):
+        return jsonify({'error': 'Invalid or missing API key'}), 401
+    return None
+
 # Simple in-memory cache (URL hash -> extracted content)
 extraction_cache = {}
 CACHE_MAX_SIZE = 100
@@ -44,16 +58,38 @@ def get_cache_key(url):
     return hashlib.md5(url.encode()).hexdigest()
 
 
+MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB
+
+
 def fetch_url(url):
-    """Fetch URL content with proper headers."""
+    """Fetch URL content with proper headers. Enforces a 10MB size limit."""
     headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
     }
-    response = requests.get(url, headers=headers, timeout=15)
+    response = requests.get(url, headers=headers, timeout=15, stream=True)
     response.raise_for_status()
-    return response.text
+
+    # Check Content-Length header first
+    content_length = response.headers.get('Content-Length')
+    if content_length and int(content_length) > MAX_CONTENT_SIZE:
+        response.close()
+        raise ValueError(f'Response too large: {int(content_length)} bytes exceeds {MAX_CONTENT_SIZE} byte limit')
+
+    # Read in chunks to enforce limit even without Content-Length
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        total += len(chunk)
+        if total > MAX_CONTENT_SIZE:
+            response.close()
+            raise ValueError(f'Response too large: exceeds {MAX_CONTENT_SIZE} byte limit')
+        chunks.append(chunk)
+
+    content = b''.join(chunks)
+    encoding = response.encoding or response.apparent_encoding or 'utf-8'
+    return content.decode(encoding, errors='replace')
 
 
 def resolve_image_url(src, base_url):
@@ -929,13 +965,24 @@ def content_extractor():
         return "<h1>GARB Extraction Service - Running</h1><p>POST a URL or JSON with raw HTML to extract article content. Using Trafilatura (primary) with Readability fallback for optimal extraction.</p>"
 
     if request.method == 'POST':
+        # Check API key authentication
+        auth_error = check_api_key()
+        if auth_error:
+            return auth_error
+
         try:
             # Check if it's JSON (raw HTML mode) or plain text (URL mode)
             content_type = request.content_type or ''
 
             if 'application/json' in content_type:
                 # JSON mode: { url: "...", html: "..." }
-                data = request.get_json()
+                data = request.get_json(silent=True)
+                if data is None:
+                    return jsonify({'error': 'Invalid JSON body'}), 400
+                if not isinstance(data, dict):
+                    return jsonify({'error': 'Request body must be a JSON object'}), 400
+                if 'url' not in data and 'html' not in data:
+                    return jsonify({'error': "Request must include 'url' or 'html' field"}), 400
                 url = data.get('url', '')
                 raw_html = data.get('html', '')
                 use_raw_html = bool(raw_html)
@@ -1087,6 +1134,9 @@ def health_check():
 @app.route('/clear-cache', methods=['POST'])
 def clear_cache():
     """Clear the extraction cache."""
+    auth_error = check_api_key()
+    if auth_error:
+        return auth_error
     extraction_cache.clear()
     return jsonify({'status': 'cache cleared'})
 
